@@ -247,8 +247,14 @@ def _run_callback_server(expected_state: str, out: _CallbackState) -> HTTPServer
 mcp = FastMCP("keycloak-mcp")
 
 
+
+IS_AZURE = os.getenv("WEBSITE_INSTANCE_ID") is not None
+
 @mcp.tool()
 def login() -> Dict[str, Any]:
+    if IS_AZURE:
+        return {"ok": False, "error": "interactive_login_not_supported_on_server"}
+
     verifier = _pkce_verifier()
     challenge = _pkce_challenge(verifier)
     state = secrets.token_urlsafe(24)
@@ -491,5 +497,6 @@ def get_customer_and_its_environment() -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run()
-
+    port = int(os.environ.get("PORT", "8000"))
+    # Streamable HTTP transport for cloud hosting
+    mcp.run(transport="http", host="0.0.0.0", port=port, path="/mcp")
