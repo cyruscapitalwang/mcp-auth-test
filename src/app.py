@@ -1,3 +1,4 @@
+# app.py
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List
@@ -60,7 +61,6 @@ class KeycloakConfig:
 
 CFG = KeycloakConfig()
 _JWK_CLIENT = PyJWKClient(CFG.jwks_uri)
-
 DEFAULT_SCOPES: List[str] = ["openid", "profile", "email"]
 
 
@@ -86,12 +86,8 @@ def verify_jwt(access_token: str) -> Dict[str, Any]:
         signing_key,
         algorithms=["RS256"],
         issuer=CFG.issuer,
-        options={"verify_aud": False},  # enforce aud manually if configured
+        options={"verify_aud": False},  # enforce aud manually below if configured
     )
-
-    print("==== JWT CLAIMS ====")
-    print(claims)
-    print("====================")
 
     if CFG.expected_azp:
         azp = claims.get("azp")
@@ -120,19 +116,40 @@ def verify_jwt(access_token: str) -> Dict[str, Any]:
 
 def _external_base_url(request: Request) -> str:
     """
-    Build absolute base URL as seen externally (important behind Azure App Service proxy).
+    Build absolute base URL as seen externally (important behind Azure App Service reverse proxy).
     """
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
+    host = request.headers.get(
+        "x-forwarded-host", request.headers.get("host", request.url.netloc)
+    )
     return f"{proto}://{host}"
 
 
 # ============================================================
-# Discovery Endpoints
+# IMPORTANT: prevent /mcp -> /mcp/ 307 redirects (Claude drops Authorization on redirect)
+# ============================================================
+
+class NoRedirectSlashFix:
+    """
+    Claude POSTs /mcp (no trailing slash). Some sub-apps redirect to /mcp/.
+    Claude often drops Authorization on redirect -> 401.
+    This middleware rewrites the path internally with NO redirect.
+    """
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/mcp":
+            scope = dict(scope)
+            scope["path"] = "/mcp/"  # internal rewrite; preserves headers
+        await self.app(scope, receive, send)
+
+
+# ============================================================
+# Discovery Endpoints (Claude Desktop probes these)
 # ============================================================
 
 async def oidc_config(_request: Request):
-    # OIDC discovery for Keycloak
     return JSONResponse(
         {
             "issuer": CFG.issuer,
@@ -146,17 +163,12 @@ async def oidc_config(_request: Request):
             "scopes_supported": DEFAULT_SCOPES,
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],
-            "token_endpoint_auth_methods_supported": ["none", "client_secret_basic", "client_secret_post"],
+            "token_endpoint_auth_methods_supported": ["none"],
         }
     )
 
 
 async def oauth_authorization_server(request: Request):
-    """
-    RFC 8414: OAuth Authorization Server Metadata.
-    IMPORTANT: issuer = THIS server base URL (so /register lives here),
-    but auth/token endpoints remain Keycloak.
-    """
     base = _external_base_url(request)
     return JSONResponse(
         {
@@ -175,10 +187,6 @@ async def oauth_authorization_server(request: Request):
 
 
 async def oauth_protected_resource_root(request: Request):
-    """
-    RFC 9728: OAuth Protected Resource Metadata.
-    authorization_servers MUST point to THIS server base.
-    """
     base = _external_base_url(request)
     return JSONResponse(
         {
@@ -195,17 +203,7 @@ async def oauth_protected_resource_mcp(request: Request):
 
 
 async def register_client(request: Request):
-    """
-    Claude Desktop POSTs /register. We return your EXISTING Keycloak client_id.
-    """
     base = _external_base_url(request)
-
-    # Not required, but safe if Claude sends JSON body.
-    try:
-        await request.json()
-    except Exception:
-        pass
-
     return JSONResponse(
         {
             "client_id": CFG.client_id,
@@ -215,8 +213,6 @@ async def register_client(request: Request):
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
             "scope": " ".join(DEFAULT_SCOPES),
-
-            # Debug hints (harmless extra fields)
             "authorization_endpoint": CFG.authorization_endpoint,
             "token_endpoint": CFG.token_endpoint,
             "issuer_for_tokens": CFG.issuer,
@@ -226,7 +222,7 @@ async def register_client(request: Request):
 
 
 # ============================================================
-# Auth Middleware
+# Auth Middleware (protect /mcp; allow well-known + register)
 # ============================================================
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -236,7 +232,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if request.method == "OPTIONS":
             return await call_next(request)
 
-        # Allow discovery + register + health without auth
         if (
             path == "/"
             or path == "/healthz"
@@ -246,15 +241,22 @@ class AuthMiddleware(BaseHTTPMiddleware):
         ):
             return await call_next(request)
 
-        # Protect MCP endpoint
         if path.startswith("/mcp"):
             token = extract_bearer_token(request)
             if not token:
                 return JSONResponse({"error": "missing_bearer_token"}, status_code=401)
+
             try:
-                request.state.jwt_claims = verify_jwt(token)
+                claims = verify_jwt(token)
+                # Optional debug
+                print("==== JWT CLAIMS ====")
+                print(claims)
+                print("====================")
+                request.state.jwt_claims = claims
             except Exception as e:
-                return JSONResponse({"error": "invalid_token", "details": str(e)}, status_code=401)
+                return JSONResponse(
+                    {"error": "invalid_token", "details": str(e)}, status_code=401
+                )
 
         return await call_next(request)
 
@@ -272,12 +274,14 @@ FAKE_DATABASE = {
     ("bse", "sit"): 2100,
 }
 
-
 @mcp.tool()
 def get_sku_count(customer: str, environment: str) -> Dict[str, Any]:
     key = (customer.lower(), environment.lower())
-    return {"customer": customer, "environment": environment, "sku_count": FAKE_DATABASE.get(key, 0)}
-
+    return {
+        "customer": customer,
+        "environment": environment,
+        "sku_count": FAKE_DATABASE.get(key, 0),
+    }
 
 @mcp.tool()
 def get_customer_and_its_environment() -> Dict[str, Any]:
@@ -301,10 +305,8 @@ mcp_app = mcp.http_app(path="/")
 async def root(_request: Request):
     return PlainTextResponse("ok")
 
-
 async def healthz(_request: Request):
     return PlainTextResponse("ok")
-
 
 async def whoami(request: Request):
     token = extract_bearer_token(request)
@@ -321,48 +323,51 @@ async def whoami(request: Request):
 # Starlette App
 # ============================================================
 
-app = Starlette(
+_starlette_app = Starlette(
     debug=False,
     routes=[
         Route("/", root, methods=["GET"]),
         Route("/healthz", healthz, methods=["GET"]),
         Route("/whoami", whoami, methods=["GET"]),
 
-        # Root discovery (what Claude probes)
         Route("/.well-known/openid-configuration", oidc_config, methods=["GET"]),
         Route("/.well-known/oauth-authorization-server", oauth_authorization_server, methods=["GET"]),
         Route("/.well-known/oauth-protected-resource", oauth_protected_resource_root, methods=["GET"]),
         Route("/.well-known/oauth-protected-resource/mcp", oauth_protected_resource_mcp, methods=["GET"]),
 
-        # Also under /mcp (some clients probe relative to MCP base URL)
         Route("/mcp/.well-known/openid-configuration", oidc_config, methods=["GET"]),
         Route("/mcp/.well-known/oauth-authorization-server", oauth_authorization_server, methods=["GET"]),
         Route("/mcp/.well-known/oauth-protected-resource", oauth_protected_resource_root, methods=["GET"]),
         Route("/mcp/.well-known/oauth-protected-resource/mcp", oauth_protected_resource_mcp, methods=["GET"]),
 
-        # Claude registration
         Route("/register", register_client, methods=["POST"]),
 
-        # MCP (mounted twice to avoid any redirect edge cases)
         Mount("/mcp", app=mcp_app),
-        Mount("/mcp/", app=mcp_app),
     ],
     lifespan=mcp_app.lifespan,
 )
 
-app.add_middleware(
+# If supported by your Starlette version, prevent redirecting /mcp -> /mcp/
+try:
+    _starlette_app.router.redirect_slashes = False
+except Exception:
+    pass
+
+# Add middleware while it's still a Starlette object
+_starlette_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=False,
 )
+_starlette_app.add_middleware(AuthMiddleware)
 
-app.add_middleware(AuthMiddleware)
+# FINAL: wrap to internally rewrite /mcp -> /mcp/ with NO redirect
+app = NoRedirectSlashFix(_starlette_app)
 
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
