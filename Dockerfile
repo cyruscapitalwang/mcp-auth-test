@@ -39,4 +39,4 @@ ENV MCP_TRANSPORT=streamable-http
 ENV PORT=8000
 EXPOSE 8000
 
-CMD ["python", "src/main.py"]
+CMD ["python", "src/app.py"]
