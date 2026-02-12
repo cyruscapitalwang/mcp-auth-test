@@ -35,6 +35,8 @@ RUN uv pip install --system --no-cache-dir .
 # App code
 COPY src/ ./src
 
-EXPOSE 3103
+ENV MCP_TRANSPORT=streamable-http
+ENV PORT=8000
+EXPOSE 8000
 
 CMD ["python", "src/main.py"]

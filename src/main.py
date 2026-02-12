@@ -27,18 +27,25 @@ class KeycloakConfig:
     realm: str = os.environ.get("KC_REALM", "gains")
     client_id: str = os.environ.get("KC_CLIENT_ID", "claude-mcp")
 
+    # Local callback settings (ONLY for local Claude Desktop stdio usage)
     redirect_host: str = os.environ.get("KC_REDIRECT_HOST", "127.0.0.1")
     redirect_port: int = int(os.environ.get("KC_REDIRECT_PORT", "8765"))
     redirect_path: str = os.environ.get("KC_REDIRECT_PATH", "/callback")
 
     scope: str = os.environ.get("KC_SCOPE", "openid profile email")
 
+    # IMPORTANT: set KC_TOKEN_PATH=/home/claude-mcp/keycloak_tokens.json in Azure
     token_path: str = os.environ.get(
         "KC_TOKEN_PATH",
         os.path.expanduser("~/.cache/claude-mcp/keycloak_tokens.json"),
     )
 
     timeout_seconds: float = float(os.environ.get("KC_TIMEOUT", "20"))
+    device_timeout_seconds: int = int(os.environ.get("KC_DEVICE_TIMEOUT", "240"))
+
+    @property
+    def device_authorization_url(self) -> str:
+        return f"{self.base_url}/realms/{self.realm}/protocol/openid-connect/auth/device"
 
     @property
     def redirect_uri(self) -> str:
@@ -166,7 +173,7 @@ def _refresh(tokens: Dict[str, Any]) -> Dict[str, Any]:
 def _get_valid_access_token() -> str:
     tokens = _load_tokens()
     if not tokens:
-        raise RuntimeError("Not logged in. Call login() first.")
+        raise RuntimeError("Not logged in. Use start_device_login() then finish_device_login().")
     if _is_access_token_expired(tokens):
         tokens = _refresh(tokens)
         _save_tokens(tokens)
@@ -189,7 +196,7 @@ def _verify_jwt_signature(access_token: str) -> Dict[str, Any]:
         options={"verify_aud": False},
     )
     return payload
-
+    
 
 class _CallbackState:
     def __init__(self):
@@ -245,7 +252,8 @@ def _run_callback_server(expected_state: str, out: _CallbackState) -> HTTPServer
 
 
 mcp = FastMCP("keycloak-mcp")
-
+    
+IS_AZURE = os.getenv("WEBSITE_INSTANCE_ID") is not None
 
 
 def _fetch_userinfo(access_token: str) -> Dict[str, Any]:
@@ -257,6 +265,103 @@ def _fetch_userinfo(access_token: str) -> Dict[str, Any]:
         return {"ok": True, "userinfo": r.json()}
 
 
+def _device_token_poll(device_code: str, interval: int, timeout_seconds: int) -> Dict[str, Any]:
+    deadline = time.time() + timeout_seconds
+    interval = max(1, int(interval))
+
+    data = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "client_id": CFG.client_id,
+        "device_code": device_code,
+    }
+
+    with httpx.Client(timeout=CFG.timeout_seconds) as client:
+        while time.time() < deadline:
+            r = client.post(CFG.token_url, data=data)
+
+            if r.status_code == 200:
+                tokens = r.json()
+                if "expires_in" in tokens:
+                    tokens["expires_at"] = _now() + int(tokens["expires_in"])
+                return tokens
+
+            # Expect OAuth error JSON: authorization_pending / slow_down / expired_token / access_denied
+            try:
+                body = r.json()
+                err = body.get("error")
+                desc = body.get("error_description")
+            except Exception:
+                err = None
+                desc = r.text
+
+            if err == "authorization_pending":
+                time.sleep(interval)
+                continue
+            if err == "slow_down":
+                interval += 2
+                time.sleep(interval)
+                continue
+            if err in ("access_denied", "expired_token"):
+                raise RuntimeError(f"{err}: {desc}")
+
+            # Unexpected
+            r.raise_for_status()
+
+    raise TimeoutError("Timed out waiting for device authorization.")
+
+
+@mcp.tool()
+def start_device_login() -> Dict[str, Any]:
+    """
+    Start OAuth Device Code flow. User completes login in browser.
+    Returns verification URL + user_code + device_code.
+    """
+    data = {"client_id": CFG.client_id, "scope": CFG.scope}
+
+    with httpx.Client(timeout=CFG.timeout_seconds) as client:
+        r = client.post(CFG.device_authorization_url, data=data)
+        r.raise_for_status()
+        payload = r.json()
+
+    return {
+        "ok": True,
+        "message": "Open verification_uri (or verification_uri_complete) and complete login.",
+        "verification_uri": payload.get("verification_uri"),
+        "verification_uri_complete": payload.get("verification_uri_complete"),
+        "user_code": payload.get("user_code"),
+        "device_code": payload.get("device_code"),
+        "expires_in": payload.get("expires_in"),
+        "interval": payload.get("interval", 5),
+    }
+
+
+@mcp.tool()
+def finish_device_login(device_code: str, interval: int = 5) -> Dict[str, Any]:
+    """
+    Poll token endpoint until user finishes auth. Saves tokens.
+    """
+    if not device_code or not device_code.strip():
+        return {"ok": False, "error": "missing_device_code"}
+
+    try:
+        tokens = _device_token_poll(
+            device_code=device_code.strip(),
+            interval=interval,
+            timeout_seconds=int(CFG.device_timeout_seconds),
+        )
+    except Exception as e:
+        return {"ok": False, "error": "device_login_failed", "details": str(e)}
+
+    _save_tokens(tokens)
+
+    info = _fetch_userinfo(tokens["access_token"])
+    return {
+        "ok": True,
+        "token_saved_to": CFG.token_path,
+        "userinfo": info,
+    }
+
+
 @mcp.tool()
 def whoami() -> Dict[str, Any]:
     at = _get_valid_access_token()
@@ -265,6 +370,14 @@ def whoami() -> Dict[str, Any]:
 
 @mcp.tool()
 def login() -> Dict[str, Any]:
+    
+    if IS_AZURE:
+        return {
+            "ok": False,
+            "error": "interactive_login_not_supported_on_azure",
+            "hint": "Use start_device_login() then finish_device_login(device_code)."
+        }
+    
     verifier = _pkce_verifier()
     challenge = _pkce_challenge(verifier)
     state = secrets.token_urlsafe(24)
@@ -501,7 +614,7 @@ if __name__ == "__main__":
 
     if transport in ("http", "streamable-http"):
         port = int(os.environ.get("PORT", "8000"))
-        mcp.run(transport="http", host="0.0.0.0", port=port, path="/mcp")
+        mcp.run(transport="streamable-http", host="0.0.0.0", port=port, path="/mcp")
     else:
         mcp.run()  # stdio for Claude Desktop
 
