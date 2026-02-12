@@ -15,7 +15,7 @@ import httpx
 import jwt
 from jwt import PyJWKClient
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 
 @dataclass(frozen=True)
@@ -248,13 +248,23 @@ mcp = FastMCP("keycloak-mcp")
 
 
 
-IS_AZURE = os.getenv("WEBSITE_INSTANCE_ID") is not None
+def _fetch_userinfo(access_token: str) -> Dict[str, Any]:
+    headers = {"Authorization": f"Bearer {access_token}"}
+    with httpx.Client(timeout=CFG.timeout_seconds) as client:
+        r = client.get(CFG.userinfo_url, headers=headers)
+        if r.status_code != 200:
+            return {"ok": False, "status": r.status_code, "body": r.text}
+        return {"ok": True, "userinfo": r.json()}
+
+
+@mcp.tool()
+def whoami() -> Dict[str, Any]:
+    at = _get_valid_access_token()
+    return _fetch_userinfo(at)
+
 
 @mcp.tool()
 def login() -> Dict[str, Any]:
-    if IS_AZURE:
-        return {"ok": False, "error": "interactive_login_not_supported_on_server"}
-
     verifier = _pkce_verifier()
     challenge = _pkce_challenge(verifier)
     state = secrets.token_urlsafe(24)
@@ -295,25 +305,15 @@ def login() -> Dict[str, Any]:
     tokens = _token_exchange(out.code, verifier)
     _save_tokens(tokens)
 
-    info = whoami()
+    # ✅ call helper, not the tool
+    info = _fetch_userinfo(tokens["access_token"])
+
     return {
         "ok": True,
         "redirect_uri": CFG.redirect_uri,
         "token_saved_to": CFG.token_path,
         "userinfo": info,
     }
-
-
-@mcp.tool()
-def whoami() -> Dict[str, Any]:
-    at = _get_valid_access_token()
-    headers = {"Authorization": f"Bearer {at}"}
-    with httpx.Client(timeout=CFG.timeout_seconds) as client:
-        r = client.get(CFG.userinfo_url, headers=headers)
-        if r.status_code != 200:
-            return {"ok": False, "status": r.status_code, "body": r.text}
-        return {"ok": True, "userinfo": r.json()}
-
 
 @mcp.tool()
 def verify_token_signature() -> Dict[str, Any]:
@@ -497,6 +497,11 @@ def get_customer_and_its_environment() -> dict:
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    # Streamable HTTP transport for cloud hosting
-    mcp.run(transport="http", host="0.0.0.0", port=port, path="/mcp")
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+
+    if transport in ("http", "streamable-http"):
+        port = int(os.environ.get("PORT", "8000"))
+        mcp.run(transport="http", host="0.0.0.0", port=port, path="/mcp")
+    else:
+        mcp.run()  # stdio for Claude Desktop
+

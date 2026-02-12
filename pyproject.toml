@@ -7,6 +7,6 @@ requires-python = ">=3.13"
 dependencies = [
     "cryptography>=46.0.4",
     "httpx>=0.28.1",
-    "mcp>=1.26.0",
+    "fastmcp>=2.14.1",
     "pyjwt>=2.11.0",
 ]
