@@ -13,13 +13,12 @@ https://<your-app>.azurewebsites.net/mcp
 
 
 $ACR_NAME = "gmlecontainerregistry"
-$IMAGE_NAME = "mcp-gx-data"
+$IMAGE_NAME = "mcp-auth-test"
 $TAG = "latest"
 
 # Authenticate
 az login
 
 # Build and push
-az acr build --image $ACR_NAME.azurecr.io/${IMAGE_NAME}:$TAG `
-  --registry $ACR_NAME .
+az acr build --image gmlecontainerregistry.azurecr.io/mcp-auth-test:latest --registry gmlecontainerregistry .
 ```
