@@ -23,16 +23,16 @@ from starlette.routing import Mount, Route
 class KeycloakConfig:
     base_url: str = os.environ.get(
         "KC_BASE_URL",
-        "https://keycloak.grayisland-59e8a8bb.eastus.azurecontainerapps.io",
+        "https://auth-dev.gainsapps.com",
     )
-    realm: str = os.environ.get("KC_REALM", "gains")
+    realm: str = os.environ.get("KC_REALM", "GAINSystems")
 
     # Keycloak client that Claude will use when doing auth code + PKCE
-    client_id: str = os.environ.get("KC_CLIENT_ID", "claude-mcp").strip()
+    client_id: str = os.environ.get("KC_CLIENT_ID", "claude_mcp").strip()
 
     # Optional: enforce token was issued to this Keycloak client (azp claim).
     # Set KC_EXPECTED_AZP="" to disable.
-    expected_azp: str = os.environ.get("KC_EXPECTED_AZP", "claude-mcp").strip()
+    expected_azp: str = os.environ.get("KC_EXPECTED_AZP", "claude_mcp").strip()
 
     # Optional: enforce audience (ONLY if your Keycloak tokens include your API as aud).
     # Set KC_EXPECTED_AUD="" to disable.

@@ -1,0 +1,7 @@
+{
+   "DB-TYPE":"postgres",
+   "SERVER":"carygroup-dev.gainsystems.com:5432",
+   "DATABASE":"carygroup",
+   "USERNAME":"",
+   "PASSWORD":""
+}
