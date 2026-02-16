@@ -23,7 +23,7 @@ from starlette.routing import Mount, Route
 class KeycloakConfig:
     base_url: str = os.environ.get(
         "KC_BASE_URL",
-        "https://auth-dev.gainsapps.com",
+        "https://keycloak.grayisland-59e8a8bb.eastus.azurecontainerapps.io",
     )
     realm: str = os.environ.get("KC_REALM", "GAINSystems")
 
